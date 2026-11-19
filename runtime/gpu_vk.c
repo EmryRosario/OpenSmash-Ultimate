@@ -1032,8 +1032,10 @@ static const char *mode_name(VkPresentModeKHR m) {
     return m == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : m == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : "fifo";
 }
 
+static void queue_drain(void);   /* (below: the submit thread) */
 static void destroy_swapchain(void) {
     if (!swapchain) return;
+    queue_drain();   /* (vkDeviceWaitIdle needs the queue to itself: the submit thread's jobs run first) */
     vkDeviceWaitIdle(device);
     for (u32 i = 0; i < nswap; i++) vkDestroySemaphore(device, swap_ready[i], NULL);
     vkDestroySwapchainKHR(device, swapchain, NULL);
@@ -1172,8 +1174,104 @@ static const char *capture_path(char *path, size_t size) {
     return path;
 }
 
+/* ---- the submit thread (SSBU_VK_SUBMIT_THREAD=1) --------------------------------------------------
+ * The GPU thread records a frame's commands, then hands them to the queue: vkQueueSubmit, and at a present
+ * vkQueuePresentKHR, which in FIFO (and with some drivers in any mode) may block until the presentation
+ * engine takes the picture. With this switch those two calls run on a thread of their own, in the order
+ * they were asked for, and the GPU thread goes on with the next frame's draws meanwhile.
+ *
+ * What makes it safe:
+ * - `queue` is used by this thread only while it is on (the GPU thread hands every submission over), and
+ *   vkDeviceWaitIdle, which needs every queue to itself, drains it first (destroy_swapchain).
+ * - The swap chain is used by vkAcquireNextImageKHR on the GPU thread and by vkQueuePresentKHR here: a
+ *   present drains the thread before it acquires, so the two never overlap. The overlap gained is the
+ *   previous present against this frame's draws, which is the part that blocked.
+ * - A frame slot's fence is reset before its submission is queued and waited for (cmd(), flush_wait, the
+ *   pictures to files) as before: a wait on a fence not yet submitted simply lasts until it is.
+ * - A present's result (out of date, first picture shown) is taken by the next present on the GPU thread:
+ *   the swap chain is made again one frame later than without the thread.
+ * Off by default (0): every call made on the GPU thread, as before. */
+typedef struct QJob { VkCommandBuffer cmd; VkSemaphore wait, signal; VkFence fence; VkSwapchainKHR swapchain; uint32_t index; int present; } QJob;
+#define QJOBS 16
+static QJob qjobs[QJOBS];
+static u64 qput, qgot;   /* (jobs queued and run: qjobs[n % QJOBS] is number n) */
+static SRWLOCK qlock = SRWLOCK_INIT;
+static CONDITION_VARIABLE qwork = CONDITION_VARIABLE_INIT, qidle = CONDITION_VARIABLE_INIT;
+static int qthread;   /* 1: the thread runs the queue's calls */
+static volatile LONG q_out_of_date, q_shown;
+static u64 vk_ns_queue_wait;   /* (the GPU thread's time waiting for the submit thread: drains, a full queue) */
+static void present_spacing(void);
+
+static void queue_run(const QJob *j) {
+    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, j->wait ? 1u : 0u, &j->wait, &stage, 1, &j->cmd, j->signal ? 1u : 0u, &j->signal};
+    check(vkQueueSubmit(queue, 1, &si, j->fence), "submitting a frame");
+    if (!j->present) return;
+    VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &j->signal, 1, &j->swapchain, &j->index, NULL};
+    VkResult pr = vkQueuePresentKHR(queue, &pi);
+    present_spacing();
+    if (pr == VK_SUBOPTIMAL_KHR || pr == VK_ERROR_OUT_OF_DATE_KHR) InterlockedExchange(&q_out_of_date, 1);
+    else check(pr, "showing a frame");
+    if (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR) InterlockedExchange(&q_shown, 1);
+}
+
+static DWORD WINAPI submit_main(void *unused) {
+    (void)unused;
+    SetThreadDescription(GetCurrentThread(), L"vk submit");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    for (;;) {
+        AcquireSRWLockExclusive(&qlock);
+        while (qgot == qput) SleepConditionVariableSRW(&qwork, &qlock, INFINITE, 0);
+        QJob j = qjobs[qgot % QJOBS];
+        ReleaseSRWLockExclusive(&qlock);
+        queue_run(&j);
+        AcquireSRWLockExclusive(&qlock);
+        qgot++;
+        WakeAllConditionVariable(&qidle);
+        ReleaseSRWLockExclusive(&qlock);
+    }
+}
+
+static void queue_start(void) {
+    const char *env = getenv("SSBU_VK_SUBMIT_THREAD");
+    if (!(env && *env && *env != '0')) return;
+    HANDLE t = CreateThread(NULL, 0, submit_main, NULL, 0, NULL);
+    if (!t) { fprintf(stderr, "[vulkan] SSBU_VK_SUBMIT_THREAD: cannot start the submit thread; submissions stay on the GPU thread\n"); return; }
+    CloseHandle(t);
+    qthread = 1;
+    fprintf(stderr, "[vulkan] submissions and presents on a thread of their own (SSBU_VK_SUBMIT_THREAD)\n");
+}
+
+static void queue_put(const QJob *j) {
+    u64 t0 = 0;
+    AcquireSRWLockExclusive(&qlock);
+    if (qput - qgot >= QJOBS) {
+        t0 = rt_clock_ns();
+        while (qput - qgot >= QJOBS) SleepConditionVariableSRW(&qidle, &qlock, INFINITE, 0);
+    }
+    qjobs[qput % QJOBS] = *j;
+    qput++;
+    WakeConditionVariable(&qwork);
+    ReleaseSRWLockExclusive(&qlock);
+    if (t0) vk_ns_queue_wait += rt_clock_ns() - t0;
+}
+
+/* Every job queued so far run: `queue` and the swap chain are the caller's again. */
+static void queue_drain(void) {
+    if (!qthread) return;
+    AcquireSRWLockExclusive(&qlock);
+    if (qgot != qput) {
+        u64 t0 = rt_clock_ns();
+        while (qgot != qput) SleepConditionVariableSRW(&qidle, &qlock, INFINITE, 0);
+        vk_ns_queue_wait += rt_clock_ns() - t0;
+    }
+    ReleaseSRWLockExclusive(&qlock);
+}
+
 /* ---- frames shown ------------------------------------------------------------------------------- */
-static void submit(VkSemaphore wait, VkSemaphore signal) {
+/* The frame's commands ended and submitted; with the submit thread on, `present_index` >= 0 also presents swap chain
+ * image `present_index` once `signal` (its swap_ready semaphore) is signalled, in the same job. */
+static void submit_ex(VkSemaphore wait, VkSemaphore signal, int present_index) {
     Frame *f = &frames[frame_at];
     end_rendering();
     if (!f->recording) cmd();
@@ -1181,11 +1279,17 @@ static void submit(VkSemaphore wait, VkSemaphore signal) {
     check(vkEndCommandBuffer(f->cmd), "ending a frame's commands");
     f->recording = 0;
     vkResetFences(device, 1, &f->done);
-    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, wait ? 1u : 0u, &wait, &stage, 1, &f->cmd, signal ? 1u : 0u, &signal};
-    check(vkQueueSubmit(queue, 1, &si, f->done), "submitting a frame");
+    if (qthread) {
+        QJob j = {f->cmd, wait, signal, f->done, swapchain, present_index >= 0 ? (uint32_t)present_index : 0u, present_index >= 0};
+        queue_put(&j);
+    } else {
+        VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, wait ? 1u : 0u, &wait, &stage, 1, &f->cmd, signal ? 1u : 0u, &signal};
+        check(vkQueueSubmit(queue, 1, &si, f->done), "submitting a frame");
+    }
     f->submitted = 1;
 }
+static void submit(VkSemaphore wait, VkSemaphore signal) { submit_ex(wait, signal, -1); }
 
 static void pipeline_cache_tick(void);
 static void vk_warm_gate(void);   /* (the shader loading at the first present) */
@@ -1212,6 +1316,10 @@ static void vk_present_(u64 guest, u32 width, u32 height) {
     (void)width; (void)height;
     enter();
     hitch_present();
+    /* (the submit thread: the last present run before the swap chain is used here, and what it found taken) */
+    queue_drain();
+    if (InterlockedExchange(&q_out_of_date, 0)) recreate = 1;
+    if (InterlockedExchange(&q_shown, 0) && !shown++) display_show_window();
     gfx_stat_presented++;
     if (gfx_stat_presented == 600) trial_passed();   /* (renderer = auto: past its first seconds) */
     unsigned bw, bh;
@@ -1302,20 +1410,32 @@ static void vk_present_(u64 guest, u32 width, u32 height) {
             vkCmdBlitImage(c, src->image, VK_IMAGE_LAYOUT_GENERAL, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
         }
         image_layout(c, img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-        submit(f->acquired, swap_ready[index]);
-        VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &swap_ready[index], 1, &swapchain, &index, NULL};
         static int gated;
-        if (!gated) {   /* (the first present: the warm start's pipelines made first, vk_warm_gate) */
-            gated = 1;
-            vk_warm_gate();
-            vk_gated = 1;
+        if (qthread) {
+            /* (submission and present in one job on the submit thread; the gate and the loading animation's end
+             * first, here, as they come before the present without it) */
+            if (!gated) {
+                gated = 1;
+                vk_warm_gate();
+                vk_gated = 1;
+            }
+            display_before_present();
+            submit_ex(f->acquired, swap_ready[index], (int)index);
+        } else {
+            submit(f->acquired, swap_ready[index]);
+            VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &swap_ready[index], 1, &swapchain, &index, NULL};
+            if (!gated) {   /* (the first present: the warm start's pipelines made first, vk_warm_gate) */
+                gated = 1;
+                vk_warm_gate();
+                vk_gated = 1;
+            }
+            display_before_present();   /* (gpu_display.c: the loading animation stops) */
+            VkResult pr = vkQueuePresentKHR(queue, &pi);
+            present_spacing();
+            if (pr == VK_SUBOPTIMAL_KHR || pr == VK_ERROR_OUT_OF_DATE_KHR) recreate = 1;
+            else check(pr, "showing a frame");
+            if ((pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR) && !shown++) display_show_window();
         }
-        display_before_present();   /* (gpu_display.c: the loading animation stops) */
-        VkResult pr = vkQueuePresentKHR(queue, &pi);
-        present_spacing();
-        if (pr == VK_SUBOPTIMAL_KHR || pr == VK_ERROR_OUT_OF_DATE_KHR) recreate = 1;
-        else check(pr, "showing a frame");
-        if ((pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR) && !shown++) display_show_window();
     } else {
         vk_stat_presents_skipped++;
         submit(VK_NULL_HANDLE, VK_NULL_HANDLE);
@@ -5795,13 +5915,13 @@ static void vk_status_lines(void) {
                     "%llu 2D blits (%llu between formats it cannot blit), %u surfaces, %u textures (%llu made, %llu decoded on the CPU), %llu MB device memory; "
                     "%llu draws: %llu drawn in %llu renderings, skipped %llu shader / %llu pipeline / %llu target / %llu topology / %llu other; "
                     "%llu shaders (%llu failed), %llu pipelines (%llu failed; %.1f s making them), %llu MB uploaded (%llu reused); %llu compute launches (%llu run, %llu skipped), %u resident regions (%llu made, %llu taken again, %llu given up, %llu copies, %llu flushed), %llu programs learned, %llu waits for results; "
-                    "time in draws %.1f s, launches %.1f s, presents %.1f s (of it waiting for the GPU %.1f s), %llu upload blocks in the card's memory\n",
+                    "time in draws %.1f s, launches %.1f s, presents %.1f s (of it waiting for the GPU %.1f s, for the submit thread %.1f s), %llu upload blocks in the card's memory\n",
             card, gfx_stat_presented, vk_stat_presents_skipped, gfx_stat_clears, vk_stat_masked_clears, vk_stat_clears_skipped, gfx_stat_blits, vk_stat_blits_skipped,
             nsurfaces, ntextures, vk_stat_textures, vk_stat_cpu_decoded, vk_stat_device_bytes >> 20, vk_stat_draws, vk_stat_drawn, vk_stat_passes, vk_stat_skip_shader, vk_stat_skip_pipeline,
             vk_stat_skip_target, vk_stat_skip_topology, vk_stat_skip_other, vk_stat_shaders, vk_stat_shader_failures, vk_stat_pipelines, vk_stat_pipeline_failures, pipeline_ns / 1e9,
             vk_stat_upload_bytes >> 20, vk_stat_reused, vk_stat_dispatches, vk_stat_dispatched, vk_stat_skip_compute, nresidents,
             vk_stat_residents_made, vk_stat_resident_refills, vk_stat_residents_retired, vk_stat_resident_copies, vk_stat_resident_flushed,
-            vk_stat_learned, vk_stat_flushes, vk_ns_draw / 1e9, vk_ns_dispatch / 1e9, vk_ns_present / 1e9, vk_ns_wait / 1e9,
+            vk_stat_learned, vk_stat_flushes, vk_ns_draw / 1e9, vk_ns_dispatch / 1e9, vk_ns_present / 1e9, vk_ns_wait / 1e9, vk_ns_queue_wait / 1e9,
             vk_stat_local_blocks);
     present_spacing_report();
     fprintf(stderr, "[status] vulkan launches' parts (s): program %.2f, constant buffers %.2f, storage buffers %.2f, set %.2f, recording %.2f, "
@@ -6384,6 +6504,7 @@ static const GfxBackend *start_backend(char *why, size_t size, int automatic) {
             have_mailbox ? " mailbox" : "");
     rt_crash_module_hook = warm_crash_note;   /* (a driver crash: the warm start's marker, or lost_note outside it) */
     makers_start();
+    queue_start();
     warm_start();
     if (limits_vendor == 0x10de) nv_cache_check(1);
     return &VULKAN;
